@@ -123,7 +123,9 @@ class CuIFFTOp(CuFFTOpBase):
                 plan[0] = fft.Plan(output_shape[1:], np.complex64, np.float32, batch=output_shape[0])
                 # need to chop off the extra dimension for real/imag here as well.
 
-            fft.ifft(input_pycuda, output_pycuda, plan[0], True)
+            fft.ifft(input_pycuda, output_pycuda, plan[0]) # , True)
+            # strangely enough, enabling rescaling here makes it run very, very slowly.
+            # so do this rescaling manually afterwards!
 
 
         thunk.inputs = inputs
@@ -214,9 +216,12 @@ def conv2d_fft(input, filters):
 
     # perform IFFT
     output_flat = cuifft(output_fft_flat) # (b * oc, i0, i1)
+
+    # rescale manually
+    output_rescaled = output_flat / (i0 * i1) 
     
     # reshape
-    output_circ = output_flat.reshape((b, oc, i0, i1)) # circular!
+    output_circ = output_rescaled.reshape((b, oc, i0, i1)) # circular!
 
     # slice because the convolution was circular, we need it to be valid
     output = output_circ[:, :, f0 - 1:, f1 - 1:]
@@ -343,8 +348,8 @@ if __name__ == '__main__':
     from theano.sandbox.cuda.basic_ops import host_from_gpu
     from theano.tensor.nnet import conv
 
-    x = theano.shared(np.random.randn(32, 128, 16, 16).astype('float32'))
-    w = theano.shared(np.random.randn(64, 128, 8, 8).astype('float32'))
+    x = theano.shared(np.random.randn(32, 64, 16, 16).astype('float32'))
+    w = theano.shared(np.random.randn(64, 64, 8, 8).astype('float32'))
 
     y = conv.conv2d(x, w)
 
