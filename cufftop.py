@@ -15,6 +15,14 @@ from scikits.cuda import fft
 
 # TODO: the elementwise product gets too big very quickly. fix this by doing the product + summing in batches.
 
+# TODO: investigate FFTW compatibility modes. Can probably set this to the fastest setting.
+# TODO: investigate the effect of enabling fastmath on FFT performance.
+
+
+# TODO: implement a ComplexElemwiseMultOp, this might be a lot quicker than the current approach.
+# it can also be made descructive (destroying its second input) which is nice.
+
+
 
 class CuFFTOpBase(cuda.GpuOp): # base class for shared code between FFT and IFFT
     def __eq__(self, other):
@@ -133,6 +141,8 @@ class CuIFFTOp(CuFFTOpBase):
         thunk.lazy = False
 
         return thunk
+
+
 
 cufft = CuFFTOp()
 cuifft = CuIFFTOp()
