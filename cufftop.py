@@ -22,7 +22,12 @@ from scikits.cuda import fft
 # TODO: implement a ComplexElemwiseMultOp, this might be a lot quicker than the current approach.
 # it can also be made descructive (destroying its second input) which is nice.
 
+# TODO: try batched_dot
+# would need two batched_dots: one for trans and one for cis. And after that we still need to concatenate them...
+# but this might be cheaper because the reduction across input channels has already happened. That's a lot less data to copy.
 
+# elementwise complex mult can perhaps be sped up by also splitting the real/imag dimensions to get (...,2,2) output and then summing as appropriate.
+# (0, 0) - (1, 1) and (0,1) + (1,0) I guess.
 
 class CuFFTOpBase(cuda.GpuOp): # base class for shared code between FFT and IFFT
     def __eq__(self, other):
@@ -148,13 +153,16 @@ cufft = CuFFTOp()
 cuifft = CuIFFTOp()
 
 
-def complex_elemwise_mult(x, y):
+def complex_elemwise_mult(x, y, no_concatenate=False):
     """
     This function computes the elemwise product of two arrays x and y,
     assuming that the last dimension is length 2 and represents the
     real and imaginary parts of the complex numbers.
 
     This is not the same as just x * y!
+
+    no_concatenate: enable to return two separate tensors, one for the real part and one for the imaginary part.
+    concatenation is expensive!
     """
     # can't do y[..., ::-1] in theano
     index_flip = [slice(None) for _ in xrange(y.ndim - 1)]
@@ -175,9 +183,113 @@ def complex_elemwise_mult(x, y):
     real_part = cis[index_0] - cis[index_1]
     imag_part = trans[index_0] + trans[index_1]
 
-    return T.concatenate([T.shape_padright(real_part), T.shape_padright(imag_part)], axis=(y.ndim - 1))
+    if no_concatenate:
+        return real_part, imag_part
+    else:
+        return T.concatenate([T.shape_padright(real_part), T.shape_padright(imag_part)], axis=(y.ndim - 1))
 
 
+def mult_and_reduce_basic(input_fft_u, filters_fft_u):
+    # elementwise product (broadcasting among b and oc dimensions)
+    output_fft_u = complex_elemwise_mult(input_fft_u, filters_fft_u) # (b, oc, ic, i0, i1//2 + 1, 2)
+
+    # sum over the input channels
+    output_fft_s = output_fft_u.sum(axis=2) # (b, oc, i0, i1//2 + 1, 2)
+
+    return output_fft_s
+
+
+def mult_and_reduce_late_concatenation(input_fft_u, filters_fft_u):
+    """
+    This version reduces across the ic dimension before concatenation, to reduce the amount of data that needs to be copied.
+    """
+    output_fft_u_real, output_fft_u_imag = complex_elemwise_mult(input_fft_u, filters_fft_u, no_concatenate=True)
+    real_part = output_fft_u_real.sum(axis=2)
+    imag_part = output_fft_u_imag.sum(axis=2)
+
+    return T.concatenate([T.shape_padright(real_part), T.shape_padright(imag_part)], axis=real_part.ndim)
+
+
+
+
+
+
+def _flip_last_dim(x):
+    """
+    Helper function because Theano does not support the ... operator
+
+    This flips the last dimension of the input tensor.
+    """
+    index_flip = [slice(None) for _ in xrange(x.ndim - 1)]
+    index_flip += [slice(None, None, -1)]
+    index_flip = tuple(index_flip)
+    return x[index_flip]
+
+def _index_last_dim(x, i):
+    """
+    Helper function because Theano does not support the ... operator
+
+    This indexes the last dimension of the input tensor with i.
+    """
+    index_i = [slice(None) for _ in xrange(x.ndim - 1)]
+    index_i += [i]
+    index_i = tuple(index_i)
+    return x[index_i]
+
+
+def _batched_dot_part(input_fft_v, filters_fft_v):    
+    """
+    input_fft_v is (b, ic, i0, i1//2 + 1, 2)
+    filters_fft_v is (oc, ic, i0, i1//2 + 1, 2)
+    """
+    b, ic, i0, i1_f, _ = input_fft_v.shape
+    oc = filters_fft_v.shape[0]
+
+    # reshape to flatten the dimensions that are multiplied elementwise
+    input_r = input_fft_v.reshape((b, ic, i0 * i1_f * 2))
+    filters_r = filters_fft_v.reshape((oc, ic, i0 * i1_f * 2))
+
+    # shuffle for batched_dot
+    input_s = input_r.dimshuffle(2, 0, 1)
+    filters_s = filters_r.dimshuffle(2, 1, 0)
+
+    output_s = T.batched_dot(input_s, filters_s) # (i0 * i1_f * 2, b, oc)
+
+    # shuffle again
+    output_r = output_s.dimshuffle(1, 2, 0)
+
+    # reshape to unflatten
+    output = output_r.reshape((b, oc, i0, i1_f, 2))
+
+    return output
+
+def mult_and_reduce_batched_dot(input_fft_v, filters_fft_v):
+    """
+    IMPORTANT: this requires input where the b and oc axes HAVE NOT BEEN SEPARATED.
+
+    This version uses theano.tensor.batched_dot to do the multiplication and reduction in one go.
+    If b, ic and oc are large enough, this should be fast - but it does two dot products for each
+    pixel in the input image! That might be painful.
+
+    input_fft_v is (b, ic, i0, i1//2 + 1, 2)
+    filters_fft_v is (oc, ic, i0, i1//2 + 1, 2)
+    """
+
+    cis = _batched_dot_part(input_fft_v, filters_fft_v)
+    trans = _batched_dot_part(input_fft_v, _flip_last_dim(filters_fft_v))
+
+    real_part = _index_last_dim(cis, 0) - _index_last_dim(cis, 1)
+    imag_part = _index_last_dim(trans, 0) + _index_last_dim(trans, 1)
+
+    return T.concatenate([T.shape_padright(real_part), T.shape_padright(imag_part)], axis=real_part.ndim)
+
+
+
+
+
+# mult_and_reduce = mult_and_reduce_basic
+# mult_and_reduce = mult_and_reduce_late_concatenation
+# mult_and_reduce = mult_and_reduce_batched_dot
 
 
 def conv2d_fft(input, filters):
@@ -214,27 +326,28 @@ def conv2d_fft(input, filters):
     # unfold ic dimension, separate b and oc
     input_fft_u = input_fft_flat.reshape((b, 1, ic, i0, i1//2 + 1, 2))
     filters_fft_u = filters_fft_flat.reshape((1, oc, ic, i0, i1//2 + 1, 2))
+    # without separate b and oc
+    input_fft_v = input_fft_flat.reshape((b, ic, i0, i1//2 + 1, 2))
+    filters_fft_v = filters_fft_flat.reshape((oc, ic, i0, i1//2 + 1, 2))
 
-    # elementwise product (broadcasting among b and oc dimensions)
-    output_fft_u = complex_elemwise_mult(input_fft_u, filters_fft_u) # (b, oc, ic, i0, i1//2 + 1, 2)
-
-    # sum over the input channels
-    output_fft_s = output_fft_u.sum(axis=2) # (b, oc, i0, i1//2 + 1, 2)
+    # elementwise product (broadcasting among b and oc dimensions) + sum along ic axis
+    # output_fft_s = mult_and_reduce_late_concatenation(input_fft_u, filters_fft_u) # (b, oc, i0, i1//2 + 1, 2)
+    output_fft_s = mult_and_reduce_batched_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
 
     # reshape for IFFT
     output_fft_flat = output_fft_s.reshape((b * oc, i0, i1//2 + 1, 2))
 
     # perform IFFT
     output_flat = cuifft(output_fft_flat) # (b * oc, i0, i1)
-
-    # rescale manually
-    output_rescaled = output_flat / (i0 * i1) 
     
     # reshape
-    output_circ = output_rescaled.reshape((b, oc, i0, i1)) # circular!
+    output_circ = output_flat.reshape((b, oc, i0, i1)) # circular!
 
     # slice because the convolution was circular, we need it to be valid
     output = output_circ[:, :, f0 - 1:, f1 - 1:]
+
+    # rescale manually
+    output = (1.0 / T.cast(i0 * i1, theano.config.floatX)) * output # allow for the scale factor to move to the gpu
 
     # output should now be the result of a batched valid convolution of the input with the filters.
     return output
@@ -358,8 +471,8 @@ if __name__ == '__main__':
     from theano.sandbox.cuda.basic_ops import host_from_gpu
     from theano.tensor.nnet import conv
 
-    x = theano.shared(np.random.randn(32, 64, 16, 16).astype('float32'))
-    w = theano.shared(np.random.randn(64, 64, 8, 8).astype('float32'))
+    x = theano.shared(np.random.randn(32, 128, 16, 16).astype('float32'))
+    w = theano.shared(np.random.randn(64, 128, 8, 8).astype('float32'))
 
     y = conv.conv2d(x, w)
 
@@ -371,18 +484,33 @@ if __name__ == '__main__':
     print "compiling fft conv"
     f_fft = theano.function([], y_fft)
 
-    # print "running default theano conv"
-    # start_time = time.time()
-    # out = f()
-    # print "%.5f s" % (time.time() - start_time)
+    print "running default theano conv"
+    start_time = time.time()
+    out = f()
+    print "%.5f s" % (time.time() - start_time)
 
-    # print "running fft conv"
-    # start_time = time.time()
-    # out_fft = f_fft()
-    # print "%.5f s" % (time.time() - start_time)
+    print "running default theano conv (2)"
+    start_time = time.time()
+    out = f()
+    print "%.5f s" % (time.time() - start_time)
 
-    for k in xrange(10):
-        f_fft()
+    print "running fft conv"
+    start_time = time.time()
+    out_fft = f_fft()
+    print "%.5f s" % (time.time() - start_time)
+
+    print "running fft conv (2)"
+    start_time = time.time()
+    out_fft = f_fft()
+    print "%.5f s" % (time.time() - start_time)
+
+    print "running fft conv (3)"
+    start_time = time.time()
+    out_fft = f_fft()
+    print "%.5f s" % (time.time() - start_time)
+
+    # for k in xrange(10):
+    #     f_fft()
 
 
 
