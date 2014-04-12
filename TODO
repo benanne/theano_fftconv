@@ -1,5 +1,16 @@
 TODO
 
+- figure out if we can do the complex elemwise mult more efficiently with scikits-cuda (or within theano). This is definitely the bottleneck.
+
+- rescaling afterwards is also quite slow (I think Theano turns this into an elemwise div, even though I wrote it as a multiplication). Maybe this can be sped up as well.
+
+- if we stick with the scan approach, maybe introduce a "batch size" to tune memory usage vs. number of scan iterations.
+    * if the compute batch size is > 1, each scan iteration does multiple elemwise multiplies in parallel
+    * afterwards we still need to sum across the compute batch size
+
+
+
+
 - build a convop optimisation that replaces the convop with the fft-product-ifft sequence.
 
 

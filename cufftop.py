@@ -284,6 +284,67 @@ def mult_and_reduce_batched_dot(input_fft_v, filters_fft_v):
     return T.concatenate([T.shape_padright(real_part), T.shape_padright(imag_part)], axis=real_part.ndim)
 
 
+def mult_and_reduce_scan(input_fft_u, filters_fft_u):
+    """
+    This version uses scan across the ic dimension to accumulate all the parts.
+    """
+
+    b, _, ic, i0, i1_f, _ = input_fft_u.shape
+    oc = filters_fft_u.shape[1]
+
+    # input_fft_u is     (b, 1, ic, i0, i1//2 + 1, 2)
+    # filterS_fft_u is   (1, oc, ic, i0, i1//2 + 1, 2)
+
+    input_fft_icfirst = input_fft_u.dimshuffle(2, 0, 1, 3, 4, 5)
+    filters_fft_icfirst = filters_fft_u.dimshuffle(2, 0, 1, 3, 4, 5)
+
+    def fn(input_part, filters_part, prev):
+        prod = complex_elemwise_mult(input_part, filters_part)
+        return prev + prod
+
+    outputs, updates = theano.scan(fn=fn,
+            outputs_info=T.zeros((b, oc, i0, i1_f, 2)),
+            sequences=[input_fft_icfirst, filters_fft_icfirst], profile=True)
+
+    assert len(updates) == 0
+
+    return outputs[-1] # (b, oc, i0, i1//2 + 1, 2)
+
+
+
+def mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u):
+    """
+    This version uses scan across the ic dimension to accumulate all the parts.
+    """
+
+    b, _, ic, i0, i1_f, _ = input_fft_u.shape
+    oc = filters_fft_u.shape[1]
+
+    # input_fft_u is     (b, 1, ic, i0, i1//2 + 1, 2)
+    # filterS_fft_u is   (1, oc, ic, i0, i1//2 + 1, 2)
+
+    input_fft_icfirst = input_fft_u.dimshuffle(2, 0, 1, 3, 4, 5)
+    filters_fft_icfirst = filters_fft_u.dimshuffle(2, 0, 1, 3, 4, 5)
+
+    def fn(input_part, filters_part, prev_real, prev_imag):
+        prod_real, prod_imag = complex_elemwise_mult(input_part, filters_part, no_concatenate=True)
+        return prev_real + prod_real, prev_imag + prod_imag
+
+    (outputs_real, outputs_imag), updates = theano.scan(fn=fn,
+            outputs_info=[T.zeros((b, oc, i0, i1_f)), T.zeros((b, oc, i0, i1_f))],
+            sequences=[input_fft_icfirst, filters_fft_icfirst]) # , profile=True)
+
+    assert len(updates) == 0
+
+    real_part = outputs_real[-1]
+    imag_part = outputs_imag[-1]
+
+    return T.concatenate([T.shape_padright(real_part), T.shape_padright(imag_part)], axis=real_part.ndim)
+    # (b, oc, i0, i1//2 + 1, 2)
+
+
+
+
 
 
 
@@ -332,7 +393,9 @@ def conv2d_fft(input, filters):
 
     # elementwise product (broadcasting among b and oc dimensions) + sum along ic axis
     # output_fft_s = mult_and_reduce_late_concatenation(input_fft_u, filters_fft_u) # (b, oc, i0, i1//2 + 1, 2)
-    output_fft_s = mult_and_reduce_batched_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
+    # output_fft_s = mult_and_reduce_batched_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
+    # output_fft_s = mult_and_reduce_scan(input_fft_u, filters_fft_u)
+    output_fft_s = mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u)
 
     # reshape for IFFT
     output_fft_flat = output_fft_s.reshape((b * oc, i0, i1//2 + 1, 2))
@@ -471,7 +534,7 @@ if __name__ == '__main__':
     from theano.sandbox.cuda.basic_ops import host_from_gpu
     from theano.tensor.nnet import conv
 
-    x = theano.shared(np.random.randn(32, 128, 16, 16).astype('float32'))
+    x = theano.shared(np.random.randn(32, 128, 32, 32).astype('float32'))
     w = theano.shared(np.random.randn(64, 128, 8, 8).astype('float32'))
 
     y = conv.conv2d(x, w)
@@ -484,33 +547,33 @@ if __name__ == '__main__':
     print "compiling fft conv"
     f_fft = theano.function([], y_fft)
 
-    print "running default theano conv"
-    start_time = time.time()
-    out = f()
-    print "%.5f s" % (time.time() - start_time)
+    # print "running default theano conv"
+    # start_time = time.time()
+    # out = f()
+    # print "%.5f s" % (time.time() - start_time)
 
-    print "running default theano conv (2)"
-    start_time = time.time()
-    out = f()
-    print "%.5f s" % (time.time() - start_time)
+    # print "running default theano conv (2)"
+    # start_time = time.time()
+    # out = f()
+    # print "%.5f s" % (time.time() - start_time)
 
-    print "running fft conv"
-    start_time = time.time()
-    out_fft = f_fft()
-    print "%.5f s" % (time.time() - start_time)
+    # print "running fft conv"
+    # start_time = time.time()
+    # out_fft = f_fft()
+    # print "%.5f s" % (time.time() - start_time)
 
-    print "running fft conv (2)"
-    start_time = time.time()
-    out_fft = f_fft()
-    print "%.5f s" % (time.time() - start_time)
+    # print "running fft conv (2)"
+    # start_time = time.time()
+    # out_fft = f_fft()
+    # print "%.5f s" % (time.time() - start_time)
 
-    print "running fft conv (3)"
-    start_time = time.time()
-    out_fft = f_fft()
-    print "%.5f s" % (time.time() - start_time)
+    # print "running fft conv (3)"
+    # start_time = time.time()
+    # out_fft = f_fft()
+    # print "%.5f s" % (time.time() - start_time)
 
-    # for k in xrange(10):
-    #     f_fft()
+    for k in xrange(10):
+        f_fft()
 
 
 
