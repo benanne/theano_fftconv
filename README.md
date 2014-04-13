@@ -11,7 +11,7 @@ scikits.cuda: https://github.com/lebedov/scikits.cuda
 
 ## Current status
 
-The implementation gives the same result as a valid convolution using Theano's own conv2d. Unfortunately it's quite slow. Interestingly, the FFTs are not the problem those account for only ~2% of running time according to Theano's profiler.
+The implementation gives the same result as a valid convolution using Theano's own conv2d. Unfortunately it's quite slow. Interestingly, the FFTs are not the problem, those account for only ~2% of running time according to Theano's profiler.
 
 The problem is the elementwise multiplication of the Fourier-transformed inputs with the Fourier-transformed filters. I have implemented this in a bunch of ways already (check the different mult_and_reduce_* functions), but performance is disappointing for all of them.
 

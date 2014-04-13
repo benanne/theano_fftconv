@@ -1,5 +1,26 @@
 TODO
 
+- adapt the code so shapes can be specified.
+
+- make a complex dot product op using scikits.cuda, and try using that inside a scan. Hopefully that speeds things up a bit.
+
+- look into using multiple CUDA streams to parallellise the computation of the dot products, this should be possible from scikits.cuda/PyCUDA.
+
+
+
+
+
+
+- use multiple cuda streams to do all the dot products concurrently? See "batching kernels": http://docs.nvidia.com/cuda/cublas/index.html#batching-kernels
+
+- somewhere in the code, it seems that 6-dim tensors are still being multiplied, even though this no longer should be happening. Figure out what's going on. Possibly Theano is being overzealous optimizing the Scan op away.
+
+- Using scikits-cuda multiplication functions
+    * adapt the batched_dot approach so the dot product uses a complex-complex dot implemented in scikits-cuda (hopefully this uses gemm under the hood?)
+    * or, adapt the scan approach so the elementwise products use scikits-cuda functions. Unfortunately they do not support broadcasting (afaik), so we need to find a workaround for that.
+
+
+
 - figure out if we can do the complex elemwise mult more efficiently with scikits-cuda (or within theano). This is definitely the bottleneck.
 
 - rescaling afterwards is also quite slow (I think Theano turns this into an elemwise div, even though I wrote it as a multiplication). Maybe this can be sped up as well.

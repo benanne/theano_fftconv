@@ -8,23 +8,22 @@ from theano.misc.pycuda_utils import to_gpuarray, to_cudandarray
 from scikits.cuda import fft
 
 
+# TODO: modify the code to use specified shapes instead of symbolic ones, if available. (or just assume they are available)
+# this might also clean up the graph a bit so it will be easier to identify the problem (i.e. why is it still multiplying 6-tensors)
+# maybe Theano is trying to be too clever and optimising away the scan op? But it's still in the profile summary...
+
 # TODO: implement __eq__ and __hash__ correctly
 # TODO: Find out if scikits.cuda.fft.fft is destructive - if so we need to specify a destroy_map
 # TODO: pycuda might provide a faster way to do elementwise multiplication of complex arrays.
 
-
-# TODO: the elementwise product gets too big very quickly. fix this by doing the product + summing in batches.
 
 # TODO: investigate FFTW compatibility modes. Can probably set this to the fastest setting.
 # TODO: investigate the effect of enabling fastmath on FFT performance.
 
 
 # TODO: implement a ComplexElemwiseMultOp, this might be a lot quicker than the current approach.
-# it can also be made descructive (destroying its second input) which is nice.
+# it can also be made destructive (destroying its second input) which is nice.
 
-# TODO: try batched_dot
-# would need two batched_dots: one for trans and one for cis. And after that we still need to concatenate them...
-# but this might be cheaper because the reduction across input channels has already happened. That's a lot less data to copy.
 
 # elementwise complex mult can perhaps be sped up by also splitting the real/imag dimensions to get (...,2,2) output and then summing as appropriate.
 # (0, 0) - (1, 1) and (0,1) + (1,0) I guess.
@@ -304,7 +303,7 @@ def mult_and_reduce_scan(input_fft_u, filters_fft_u):
 
     outputs, updates = theano.scan(fn=fn,
             outputs_info=T.zeros((b, oc, i0, i1_f, 2)),
-            sequences=[input_fft_icfirst, filters_fft_icfirst], profile=True)
+            sequences=[input_fft_icfirst, filters_fft_icfirst]) # , profile=True)
 
     assert len(updates) == 0
 
@@ -534,7 +533,7 @@ if __name__ == '__main__':
     from theano.sandbox.cuda.basic_ops import host_from_gpu
     from theano.tensor.nnet import conv
 
-    x = theano.shared(np.random.randn(32, 128, 32, 32).astype('float32'))
+    x = theano.shared(np.random.randn(64, 128, 32, 32).astype('float32'))
     w = theano.shared(np.random.randn(64, 128, 8, 8).astype('float32'))
 
     y = conv.conv2d(x, w)
@@ -572,8 +571,10 @@ if __name__ == '__main__':
     # out_fft = f_fft()
     # print "%.5f s" % (time.time() - start_time)
 
+    start_time = time.time()
     for k in xrange(10):
         f_fft()
+    print "took %.5f seconds" % (time.time() - start_time)
 
 
 
