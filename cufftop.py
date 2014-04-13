@@ -1,32 +1,25 @@
 import numpy as np 
 import theano
 
-import theano.misc.pycuda_init
 import theano.sandbox.cuda as cuda
 from theano.misc.pycuda_utils import to_gpuarray, to_cudandarray
 
 from scikits.cuda import fft
+from scikits.cuda import linalg
 
+import pycuda.gpuarray
 
-# TODO: modify the code to use specified shapes instead of symbolic ones, if available. (or just assume they are available)
-# this might also clean up the graph a bit so it will be easier to identify the problem (i.e. why is it still multiplying 6-tensors)
-# maybe Theano is trying to be too clever and optimising away the scan op? But it's still in the profile summary...
+import theano.misc.pycuda_init
+
+linalg.init()
+
 
 # TODO: implement __eq__ and __hash__ correctly
 # TODO: Find out if scikits.cuda.fft.fft is destructive - if so we need to specify a destroy_map
-# TODO: pycuda might provide a faster way to do elementwise multiplication of complex arrays.
-
 
 # TODO: investigate FFTW compatibility modes. Can probably set this to the fastest setting.
 # TODO: investigate the effect of enabling fastmath on FFT performance.
 
-
-# TODO: implement a ComplexElemwiseMultOp, this might be a lot quicker than the current approach.
-# it can also be made destructive (destroying its second input) which is nice.
-
-
-# elementwise complex mult can perhaps be sped up by also splitting the real/imag dimensions to get (...,2,2) output and then summing as appropriate.
-# (0, 0) - (1, 1) and (0,1) + (1,0) I guess.
 
 class CuFFTOpBase(cuda.GpuOp): # base class for shared code between FFT and IFFT
     def __eq__(self, other):
@@ -148,8 +141,124 @@ class CuIFFTOp(CuFFTOpBase):
 
 
 
+
+
+def to_complex_gpuarray(x, copyif=False):
+    """
+    adapted version of theano.misc.pycuda_utils.to_gpuarray that takes an array with an extra trailing
+    dimension of length 2 for real/imaginary parts, and turns it into a complex64 PyCUDA GPUArray.
+    """
+    if not isinstance(x, cuda.CudaNdarray):
+        raise ValueError("We can transfer only CudaNdarray to pycuda.gpuarray.GPUArray")
+    else:
+        # Check if trailing dimension has length 2
+        assert x.shape[-1] == 2
+
+        # check if dtype is float32
+        assert x.dtype == 'float32'
+
+        # Check if it is c contiguous
+        size = 1
+        c_contiguous = True
+        for i in range(x.ndim-1, -1, -1):
+            if x.shape[i] == 1:
+                continue
+            if x._strides[i] != size:
+                c_contiguous = False
+                break
+            size *= x.shape[i]
+        if not c_contiguous:
+            if copyif:
+                x = x.copy()
+            else:
+                raise ValueError("We were asked to not copy memory, but the memory is not c contiguous.")
+
+        # Now x is always c contiguous
+        px = pycuda.gpuarray.GPUArray(x.shape[:-1], np.complex64, base=x, gpudata=x.gpudata)
+        return px
+
+def to_complex_cudandarray(x):
+    """
+    adapted version of theano.misc.pycuda_utils.to_cudandarray that takes a complex64 array
+    and turns it into a float32 CudaNdarray with an extra trailing dimension of length 2
+    for real/imaginary parts.
+    """
+    if not isinstance(x, pycuda.gpuarray.GPUArray):
+        raise ValueError("We can transfer only pycuda.gpuarray.GPUArray to CudaNdarray")
+    elif x.dtype != "complex64":
+        raise ValueError("Only conversion from complex64 arrays is supported")
+    else:
+        # TODO: figure out what is going on here and adapt it for the complex64-float32 case.
+        strides = [1, 2]
+        for i in x.shape[::-1][:-1]:
+            strides.append(strides[-1]*i)
+        strides = tuple(strides[::-1])
+        shape = tuple(list(x.shape) + [2])
+        ptr = int(x.gpudata) # in pycuda trunk, y.ptr also works, which is a little cleaner
+        z = cuda.from_gpu_pointer(ptr, shape, strides, x)
+
+        return z
+
+
+
+class ComplexDotOp(CuFFTOpBase):
+    def make_node(self, inp1, inp2):
+        inp1 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp1))
+        inp2 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp2))
+
+        assert inp1.dtype == "float32"
+        assert inp2.dtype == "float32"
+
+        return theano.Apply(self, [inp1, inp2], [self.output_type(inp1)()])
+
+    def output_type(self, inp):
+        return cuda.CudaNdarrayType(broadcastable=[False] * inp.type.ndim) # add one extra dim for real/imag
+
+    def make_thunk(self, node, storage_map, _, _2):
+        inputs = [ storage_map[v] for v in node.inputs]
+        outputs = [ storage_map[v] for v in node.outputs]
+
+        def thunk():
+            x = inputs[0]
+            y = inputs[1]
+
+            # chop off the real/imag dimension
+            input_shape_x = x[0].shape # (a, b, 2)
+            input_shape_y = y[0].shape # (b, c, 2)
+
+            output_shape = (input_shape_x[0], input_shape_y[1], 2) # (a, c, 2)
+
+            input_x_pycuda = to_complex_gpuarray(x[0])
+            input_y_pycuda = to_complex_gpuarray(y[0])
+
+            output_pycuda = linalg.dot(input_x_pycuda, input_y_pycuda)
+
+            outputs[0][0] = to_complex_cudandarray(output_pycuda)
+
+        thunk.inputs = inputs
+        thunk.outputs = outputs
+        thunk.lazy = False
+
+        return thunk
+
+
+
+
+
+
 cufft = CuFFTOp()
 cuifft = CuIFFTOp()
+complex_dot = ComplexDotOp()
+
+
+
+
+
+
+
+
 
 
 def complex_elemwise_mult(x, y, no_concatenate=False):
@@ -343,6 +452,60 @@ def mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u):
 
 
 
+def mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v):
+    """
+    IMPORTANT: this requires input where the b and oc axes HAVE NOT BEEN SEPARATED.
+
+    This version uses theano.tensor.batched_dot to do the multiplication and reduction in one go.
+    If b, ic and oc are large enough, this should be fast - but it does two dot products for each
+    pixel in the input image! That might be painful.
+
+    input_fft_v is (b, ic, i0, i1//2 + 1, 2)
+    filters_fft_v is (oc, ic, i0, i1//2 + 1, 2)
+    """
+
+    b, ic, i0, i1_f, _ = input_fft_v.shape 
+    oc = filters_fft_v.shape[0]
+
+    # reshape to flatten the dimensions that are multiplied elemwise
+    input_r = input_fft_v.reshape((b, ic, i0 * i1_f, 2))
+    filters_r = filters_fft_v.reshape((oc, ic, i0 * i1_f, 2))
+
+    # shuffle for batched dot product
+    input_s = input_r.dimshuffle(2, 0, 1, 3) # (i0 * i1_f, b, ic, 2)
+    filters_s = filters_r.dimshuffle(2, 1, 0, 3) # (i0 * i1_f, ic, oc, 2)
+
+    def fn(input_part, filters_part):
+        return complex_dot(input_part, filters_part)
+
+    output_s, updates = theano.scan(fn=fn,
+        outputs_info=None,
+        sequences=[input_s, filters_s],
+        non_sequences=None)
+    # output_s is (i0 * i1_f, b, oc, 2)
+
+    assert len(updates) == 0
+
+    # shuffle again
+    output_r = output_s.dimshuffle(1, 2, 0, 3)
+
+    # reshape to unflatten
+    output = output_r.reshape((b, oc, i0, i1_f, 2))
+
+    return output
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
@@ -352,7 +515,7 @@ def mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u):
 # mult_and_reduce = mult_and_reduce_batched_dot
 
 
-def conv2d_fft(input, filters):
+def conv2d_fft(input, filters, image_shape=None, filter_shape=None):
     """
     expects bc01 input
     performs a valid convolution
@@ -361,10 +524,14 @@ def conv2d_fft(input, filters):
     filters: (oc, ic, f0, f1)
     """
 
-    input_shape = input.shape
-    filter_shape = filters.shape
+    # use symbolic shapes to compute shape info at runtime if not specified
+    if image_shape is None:
+        image_shape = input.shape
 
-    b, ic, i0, i1 = input_shape # batch size, input channels, input dim 0, input dim 1
+    if filter_shape is None:
+        filter_shape = filters.shape
+
+    b, ic, i0, i1 = image_shape # batch size, input channels, input dim 0, input dim 1
     oc, ic_, f0, f1 = filter_shape # output channels, input channels, filter dim 0, filter dim 1
 
     # assert ic == ic_ # same number of input channels
@@ -394,7 +561,8 @@ def conv2d_fft(input, filters):
     # output_fft_s = mult_and_reduce_late_concatenation(input_fft_u, filters_fft_u) # (b, oc, i0, i1//2 + 1, 2)
     # output_fft_s = mult_and_reduce_batched_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
     # output_fft_s = mult_and_reduce_scan(input_fft_u, filters_fft_u)
-    output_fft_s = mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u)
+    # output_fft_s = mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u)
+    output_fft_s = mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
 
     # reshape for IFFT
     output_fft_flat = output_fft_s.reshape((b * oc, i0, i1//2 + 1, 2))
@@ -533,12 +701,18 @@ if __name__ == '__main__':
     from theano.sandbox.cuda.basic_ops import host_from_gpu
     from theano.tensor.nnet import conv
 
-    x = theano.shared(np.random.randn(64, 128, 32, 32).astype('float32'))
-    w = theano.shared(np.random.randn(64, 128, 8, 8).astype('float32'))
+    x_shape = (64, 128, 32, 32)
+    w_shape = (64, 128, 8, 8)
+
+    # x_shape = (128, 128, 16, 16)
+    # w_shape = (128, 128, 8, 8)
+
+    x = theano.shared(np.random.randn(*x_shape).astype('float32'))
+    w = theano.shared(np.random.randn(*w_shape).astype('float32'))
 
     y = conv.conv2d(x, w)
 
-    y_fft = conv2d_fft(x, w)
+    y_fft = conv2d_fft(x, w, image_shape=x_shape, filter_shape=w_shape)
 
     print "compiling default theano conv"
     f = theano.function([], y)
@@ -546,35 +720,35 @@ if __name__ == '__main__':
     print "compiling fft conv"
     f_fft = theano.function([], y_fft)
 
-    # print "running default theano conv"
-    # start_time = time.time()
-    # out = f()
-    # print "%.5f s" % (time.time() - start_time)
-
-    # print "running default theano conv (2)"
-    # start_time = time.time()
-    # out = f()
-    # print "%.5f s" % (time.time() - start_time)
-
-    # print "running fft conv"
-    # start_time = time.time()
-    # out_fft = f_fft()
-    # print "%.5f s" % (time.time() - start_time)
-
-    # print "running fft conv (2)"
-    # start_time = time.time()
-    # out_fft = f_fft()
-    # print "%.5f s" % (time.time() - start_time)
-
-    # print "running fft conv (3)"
-    # start_time = time.time()
-    # out_fft = f_fft()
-    # print "%.5f s" % (time.time() - start_time)
-
+    print "running default theano conv"
     start_time = time.time()
-    for k in xrange(10):
-        f_fft()
-    print "took %.5f seconds" % (time.time() - start_time)
+    out = f()
+    print "%.5f s" % (time.time() - start_time)
+
+    print "running default theano conv (2)"
+    start_time = time.time()
+    out = f()
+    print "%.5f s" % (time.time() - start_time)
+
+    print "running fft conv"
+    start_time = time.time()
+    out_fft = f_fft()
+    print "%.5f s" % (time.time() - start_time)
+
+    print "running fft conv (2)"
+    start_time = time.time()
+    out_fft = f_fft()
+    print "%.5f s" % (time.time() - start_time)
+
+    print "running fft conv (3)"
+    start_time = time.time()
+    out_fft = f_fft()
+    print "%.5f s" % (time.time() - start_time)
+
+    # start_time = time.time()
+    # for k in xrange(10):
+    #     f_fft()
+    # print "took %.5f seconds" % (time.time() - start_time)
 
 
 

@@ -11,11 +11,6 @@ scikits.cuda: https://github.com/lebedov/scikits.cuda
 
 ## Current status
 
-The implementation gives the same result as a valid convolution using Theano's own conv2d. Unfortunately it's quite slow. Interestingly, the FFTs are not the problem, those account for only ~2% of running time according to Theano's profiler.
+The implementation gives the same result as a valid convolution using Theano's own conv2d. With the implementation of a ComplexDotOp, it seems to surpass Theano's own conv2d in speed in some scenarios. 
 
-The problem is the elementwise multiplication of the Fourier-transformed inputs with the Fourier-transformed filters. I have implemented this in a bunch of ways already (check the different mult_and_reduce_* functions), but performance is disappointing for all of them.
-
-Using a routine that is able to work with complex numbers directly would probably speed this up a lot. scikits.cuda comes with such a routine that could be wrapped in another op, but unfortunately it does not support broadcasting, so it cannot be used directly.
-
-Suggestions to speed up the elementwise product (and summing out the input_channels dimension) are welcome.
-
+On my laptop with a GT 540M (96 cores) the speedup is quite significant. On a workstation with a GTX680 (1536 cores) the improvement is less pronounced, but it's still 2x faster in many cases. This implies that we're not parallelising enough yet. Parallelising the complex dot product (using the lowlevel CUBLAS API with multiple streams, and later using cublasCgemmBatched) is the next step.

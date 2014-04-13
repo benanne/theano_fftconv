@@ -1,11 +1,24 @@
 TODO
 
-- adapt the code so shapes can be specified.
+- with the new scikits-cuda, the rescaling should be fast. Switch to rescaling inside the IFFT again (and profile)
 
-- make a complex dot product op using scikits.cuda, and try using that inside a scan. Hopefully that speeds things up a bit.
+- mult_and_reduce_batched_complex_dot is not using specified shape info yet. Fix this.
 
-- look into using multiple CUDA streams to parallellise the computation of the dot products, this should be possible from scikits.cuda/PyCUDA.
+- make a batched complex dot product op using scikits.cuda's lowlevel api with cublasCgemm and multiple streams for parallellisation
 
+- figure out how we can use cublasCgemmBatched for this instead (it's not in scikits.cuda)
+    * will need to upgrade cuda for this, it's not in cuda 5.0 (but probably in 5.5 and 6.0). Wait for now.
+
+
+
+
+
+
+
+
+* look into using multiple CUDA streams to parallellise the computation of the dot products, this should be possible from scikits.cuda/PyCUDA.
+
+* there is also cublasSgemmBatched, and cublasCgemmBatched - only the former is in scikits.cuda though. But this seems to do precisely what we need.
 
 
 
