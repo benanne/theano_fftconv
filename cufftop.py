@@ -275,7 +275,7 @@ class MultiStreamComplexDotOp(CuFFTOpBase):
         inputs = [ storage_map[v] for v in node.inputs]
         outputs = [ storage_map[v] for v in node.outputs]
 
-        num_streams = 32
+        num_streams = 32 # 32
 
         handle = [cublas.cublasCreate()]
         stream_pool = [pycuda.driver.Stream() for _ in xrange(num_streams)]
@@ -329,7 +329,7 @@ def sc_complex_dot(x_gpu, y_gpu, c_gpu, transa='N', transb='N', handle=None):
     This function does not return anything.
     """
     if handle is None:
-        handle = misc._global_cublas_handle
+        handle = scikits.cuda.misc._global_cublas_handle
 
     assert len(x_gpu.shape) == 2
     assert len(y_gpu.shape) == 2
@@ -405,12 +405,6 @@ class BatchedComplexDotOp(CuFFTOpBase):
         inputs = [ storage_map[v] for v in node.inputs]
         outputs = [ storage_map[v] for v in node.outputs]
 
-        num_streams = 32
-
-        handle = [cublas.cublasCreate()]
-        stream_pool = [pycuda.driver.Stream() for _ in xrange(num_streams)]
-        current_stream = [0]
-
         def thunk():
             bx = inputs[0]
             by = inputs[1]
@@ -426,39 +420,21 @@ class BatchedComplexDotOp(CuFFTOpBase):
             if bz[0] is None or bz[0].shape != output_shape:
                 bz[0] = cuda.CudaNdarray.zeros(output_shape)
 
-
             input_bx_pycuda = to_complex_gpuarray(bx[0])
             input_by_pycuda = to_complex_gpuarray(by[0])
             output_b_pycuda = to_complex_gpuarray(bz[0])
 
             # we want to write the results to one big contiguous array, so we can't
             # use linalg.dot here (it creates a new array and returns it)
-            # so call cublasCgemm manually.
 
             for i in xrange(input_shape_x[0]): # batch iter
                 input_x_pycuda = input_bx_pycuda[i]
                 input_y_pycuda = input_by_pycuda[i]
                 output_pycuda = output_b_pycuda[i]
 
-                # prev_stream_obj = stream_pool[(current_stream[0] - 1) % num_streams]
-                # print "DEBUG: PREV STREAM IS DONE?"
-                # print prev_stream_obj.is_done()
-                # print
+                sc_complex_dot(input_x_pycuda, input_y_pycuda, output_pycuda)
 
-                # set stream and increment counter
-                stream_obj = stream_pool[current_stream[0]]
-                cublas.cublasSetStream(handle[0], stream_obj.handle)
-                current_stream[0] += 1
-                current_stream[0] %= num_streams
-
-                sc_complex_dot(input_x_pycuda, input_y_pycuda, output_pycuda, handle=handle[0])
-
-            # multistream experiment
-            # print "DEBUG: Setting stream to %d" % current_stream[0]
-
-
-
-        
+  
         thunk.inputs = inputs
         thunk.outputs = outputs
         thunk.lazy = False
@@ -728,7 +704,7 @@ def mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v):
 
 
 
-def mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v):
+def mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v, input_shape=None, filter_shape=None):
     """
     IMPORTANT: this requires input where the b and oc axes HAVE NOT BEEN SEPARATED.
 
@@ -738,8 +714,14 @@ def mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v):
     filters_fft_v is (oc, ic, i0, i1//2 + 1, 2)
     """
 
-    b, ic, i0, i1_f, _ = input_fft_v.shape 
-    oc = filters_fft_v.shape[0]
+    if input_shape is None:
+        input_shape =  input_fft_v.shape # symbolic
+
+    if filter_shape is None:
+        filter_shape = filters_fft_v.shape # symbolic
+
+    b, ic, i0, i1_f, _ = input_shape
+    oc = filter_shape[0]
 
     # reshape to flatten the dimensions that are multiplied elemwise
     input_r = input_fft_v.reshape((b, ic, i0 * i1_f, 2))
@@ -814,9 +796,12 @@ def conv2d_fft(input, filters, image_shape=None, filter_shape=None):
     # unfold ic dimension, separate b and oc
     input_fft_u = input_fft_flat.reshape((b, 1, ic, i0, i1//2 + 1, 2))
     filters_fft_u = filters_fft_flat.reshape((1, oc, ic, i0, i1//2 + 1, 2))
+
     # without separate b and oc
-    input_fft_v = input_fft_flat.reshape((b, ic, i0, i1//2 + 1, 2))
-    filters_fft_v = filters_fft_flat.reshape((oc, ic, i0, i1//2 + 1, 2))
+    input_fft_v_shape = (b, ic, i0, i1//2 + 1, 2)
+    filters_fft_v_shape = (oc, ic, i0, i1//2 + 1, 2)
+    input_fft_v = input_fft_flat.reshape(input_fft_v_shape)
+    filters_fft_v = filters_fft_flat.reshape(filters_fft_v_shape)
 
     # elementwise product (broadcasting among b and oc dimensions) + sum along ic axis
     # output_fft_s = mult_and_reduce_late_concatenation(input_fft_u, filters_fft_u) # (b, oc, i0, i1//2 + 1, 2)
@@ -824,7 +809,8 @@ def conv2d_fft(input, filters, image_shape=None, filter_shape=None):
     # output_fft_s = mult_and_reduce_scan(input_fft_u, filters_fft_u)
     # output_fft_s = mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u)
     # output_fft_s = mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
-    output_fft_s = mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
+    output_fft_s = mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v,
+                            input_shape=input_fft_v_shape, filter_shape=filters_fft_v.shape) # (b, oc, i0, i1//2 + 1, 2)
 
     # reshape for IFFT
     output_fft_flat = output_fft_s.reshape((b * oc, i0, i1//2 + 1, 2))
@@ -963,11 +949,11 @@ if __name__ == '__main__':
     from theano.sandbox.cuda.basic_ops import host_from_gpu
     from theano.tensor.nnet import conv
 
-    # x_shape = (64, 128, 32, 32)
-    # w_shape = (64, 128, 8, 8)
+    x_shape = (64, 128, 32, 32)
+    w_shape = (64, 128, 8, 8)
 
-    x_shape = (128, 32, 54, 54)
-    w_shape = (64, 32, 6, 6)
+    # x_shape = (128, 32, 54, 54)
+    # w_shape = (64, 32, 6, 6)
 
     # x_shape = (128, 128, 16, 16)
     # w_shape = (128, 128, 8, 8)
@@ -992,35 +978,35 @@ if __name__ == '__main__':
     print "compiling fft conv"
     f_fft = theano.function([], y_fft)
 
-    print "running default theano conv"
-    start_time = time.time()
-    out = f()
-    print "%.5f s" % (time.time() - start_time)
-
-    print "running default theano conv (2)"
-    start_time = time.time()
-    out = f()
-    print "%.5f s" % (time.time() - start_time)
-
-    print "running fft conv"
-    start_time = time.time()
-    out_fft = f_fft()
-    print "%.5f s" % (time.time() - start_time)
-
-    print "running fft conv (2)"
-    start_time = time.time()
-    out_fft = f_fft()
-    print "%.5f s" % (time.time() - start_time)
-
-    print "running fft conv (3)"
-    start_time = time.time()
-    out_fft = f_fft()
-    print "%.5f s" % (time.time() - start_time)
-
+    # print "running default theano conv"
     # start_time = time.time()
-    # for k in xrange(10):
-    #     f_fft()
-    # print "took %.5f seconds" % (time.time() - start_time)
+    # out = f()
+    # print "%.5f s" % (time.time() - start_time)
+
+    # print "running default theano conv (2)"
+    # start_time = time.time()
+    # out = f()
+    # print "%.5f s" % (time.time() - start_time)
+
+    # print "running fft conv"
+    # start_time = time.time()
+    # out_fft = f_fft()
+    # print "%.5f s" % (time.time() - start_time)
+
+    # print "running fft conv (2)"
+    # start_time = time.time()
+    # out_fft = f_fft()
+    # print "%.5f s" % (time.time() - start_time)
+
+    # print "running fft conv (3)"
+    # start_time = time.time()
+    # out_fft = f_fft()
+    # print "%.5f s" % (time.time() - start_time)
+
+    start_time = time.time()
+    for k in xrange(10):
+        f_fft()
+    print "took %.5f seconds" % (time.time() - start_time)
 
 
 

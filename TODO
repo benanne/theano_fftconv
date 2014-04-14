@@ -1,61 +1,17 @@
 TODO
 
-- write a multistream test script that keeps multiple streams busy for long enough to observe whether computations are being done in parallel or not. It should be possible to parallelise a bunch of small dot products this way.
-
-
-
-
-- currently the multistream version of ComplexDot has no benefit, because the streams all finish executing before the next call is made.
-    * Theano is probably synchronising between ComplexDot executions.
-    * the best way around this seems to be to implement a monolithic ComplexBatchedDot op, which takes care of the batch iteration itself.
-    * this also neatly encapsulates everything for a comparison to cublasCgemmBatched later on. 
-
-
-- make a testscript to determine whether cublas calls issued to different streams are really executed in parallel.
-    will need to use pycuda.autoinit.context.synchronize()
-
-
-- mult_and_reduce_batched_complex_dot is not using specified shape info yet. Fix this.
-
-- even with ComplexDotOp, the code is still running faster in profile mode. What's happening here?
-
-- make a batched complex dot product op using scikits.cuda's lowlevel api with cublasCgemm and multiple streams for parallellisation
-
-- figure out how we can use cublasCgemmBatched for this instead (it's not in scikits.cuda)
+- figure out how we can use cublasCgemmBatched for this instead (it's not in scikits.cuda but it should be easy to wrap)
     * will need to upgrade cuda for this, it's not in cuda 5.0 (but probably in 5.5 and 6.0). Wait for now.
 
+- multistream does not seem to make any difference in performance (num_streams=1 and num_streams=32 perform the same)
+    * get rid of multistream code
 
+- optimise BatchedComplexDot, CuFFT and CuIFFT
 
-
-
-
-
-
-* look into using multiple CUDA streams to parallellise the computation of the dot products, this should be possible from scikits.cuda/PyCUDA.
-
-* there is also cublasSgemmBatched, and cublasCgemmBatched - only the former is in scikits.cuda though. But this seems to do precisely what we need.
-
-
-
-
-
-- use multiple cuda streams to do all the dot products concurrently? See "batching kernels": http://docs.nvidia.com/cuda/cublas/index.html#batching-kernels
-
-- somewhere in the code, it seems that 6-dim tensors are still being multiplied, even though this no longer should be happening. Figure out what's going on. Possibly Theano is being overzealous optimizing the Scan op away.
-
-- Using scikits-cuda multiplication functions
-    * adapt the batched_dot approach so the dot product uses a complex-complex dot implemented in scikits-cuda (hopefully this uses gemm under the hood?)
-    * or, adapt the scan approach so the elementwise products use scikits-cuda functions. Unfortunately they do not support broadcasting (afaik), so we need to find a workaround for that.
-
-
-
-- figure out if we can do the complex elemwise mult more efficiently with scikits-cuda (or within theano). This is definitely the bottleneck.
+- do some proper performance testing for different b, ic, oc, i0/i1, f0/f1 combinations, make some pretty graphs
 
 - rescaling afterwards is also quite slow (I think Theano turns this into an elemwise div, even though I wrote it as a multiplication). Maybe this can be sped up as well.
 
-- if we stick with the scan approach, maybe introduce a "batch size" to tune memory usage vs. number of scan iterations.
-    * if the compute batch size is > 1, each scan iteration does multiple elemwise multiplies in parallel
-    * afterwards we still need to sum across the compute batch size
 
 
 
@@ -74,37 +30,7 @@ TODO
 
 
 
-    
-Three possible approaches:
-
-- implement a convop that does FFT, product, IFFT all in one go - a drop in replacement Op for the conv op.
-
-- implement an FFT op and a macro function that can be used as a drop in replacement for the conv op, which creates fft, product and ifft nodes.
-    * this allows theano to optimize everything.
-    * have to implement the gradient of the FFT though.
-    * might not be optimal for the gradient of a convolution, it's possible that this can be expressed more easily in the original conv form.
-
-- implement an op that does FFT (does not necessarily support grad). Implement an op that functions as a conv op, but does not actually have a perform method. Instead, add an optimisation that swaps out the conv op for FFT+product+IFFT at compile time
-    * same advantage as the macro: it allows theano to optimize everything
-    * we don't need to implement the gradient of the FFT now, we can just implement the gradient of the conv op, and also express it as a conv op.
-
-- maybe we can just write an optimization that swaps the ConvOp for FFTGpuConv, like it currently swaps it for GpuConv, which is in turn a macro for GpuFFT+product+GpuIFFT. No need for gradients anywhere then!
-
-
-
-2D batch FFT with scikit cuda:
-
-    def test_batch_fft_float64_to_complex128_2d(self):
-        x = np.asarray(np.random.rand(self.B, self.N, self.M), np.float64)
-        xf = np.fft.rfftn(x, axes=(1,2))
-        x_gpu = gpuarray.to_gpu(x)
-        xf_gpu = gpuarray.empty((self.B, self.N, self.M/2+1), np.complex128)
-        plan = fft.Plan([self.N, self.M], np.float64, np.complex128, batch=self.B)
-        fft.fft(x_gpu, xf_gpu, plan)
-        assert np.allclose(xf, xf_gpu.get(), atol=atol_float64)
-
-    => will need to use float32 and complex64 obviously.
-
+- we can just write an optimization that swaps the ConvOp for FFTGpuConv, like it currently swaps it for GpuConv, which is in turn a macro for GpuFFT+product+GpuIFFT. No need for gradients anywhere then!
 
 
 
