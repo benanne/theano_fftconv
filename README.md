@@ -11,6 +11,6 @@ scikits.cuda: https://github.com/lebedov/scikits.cuda
 
 ## Current status
 
-The implementation gives the same result as a valid convolution using Theano's own conv2d. With the implementation of a BatchedComplexDot op, which executes many complex dot products in multiple streams, the performance seems to be quite good (several times faster than Theano's own conv2d in many cases).
+The implementation gives the same result as a valid convolution using Theano's own conv2d. With the implementation of a BatchedComplexDot op, the performance seems to be quite good (several times faster than Theano's own conv2d in many cases).
 
-An alternative way to parallelise the batched complex dot product is to use cublasCgemmBatched. This is the next thing to try.
+The next step is to look into parallelising the batched complex dot product (using multiple streams had no effect) using cublasCgemmBatched.
