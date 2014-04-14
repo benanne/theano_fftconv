@@ -1,8 +1,23 @@
 TODO
 
-- with the new scikits-cuda, the rescaling should be fast. Switch to rescaling inside the IFFT again (and profile)
+- write a multistream test script that keeps multiple streams busy for long enough to observe whether computations are being done in parallel or not. It should be possible to parallelise a bunch of small dot products this way.
+
+
+
+
+- currently the multistream version of ComplexDot has no benefit, because the streams all finish executing before the next call is made.
+    * Theano is probably synchronising between ComplexDot executions.
+    * the best way around this seems to be to implement a monolithic ComplexBatchedDot op, which takes care of the batch iteration itself.
+    * this also neatly encapsulates everything for a comparison to cublasCgemmBatched later on. 
+
+
+- make a testscript to determine whether cublas calls issued to different streams are really executed in parallel.
+    will need to use pycuda.autoinit.context.synchronize()
+
 
 - mult_and_reduce_batched_complex_dot is not using specified shape info yet. Fix this.
+
+- even with ComplexDotOp, the code is still running faster in profile mode. What's happening here?
 
 - make a batched complex dot product op using scikits.cuda's lowlevel api with cublasCgemm and multiple streams for parallellisation
 

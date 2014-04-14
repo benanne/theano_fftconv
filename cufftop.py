@@ -4,10 +4,14 @@ import theano
 import theano.sandbox.cuda as cuda
 from theano.misc.pycuda_utils import to_gpuarray, to_cudandarray
 
+import scikits.cuda
 from scikits.cuda import fft
 from scikits.cuda import linalg
+from scikits.cuda import cublas
+
 
 import pycuda.gpuarray
+import pycuda.driver
 
 import theano.misc.pycuda_init
 
@@ -246,11 +250,76 @@ class ComplexDotOp(CuFFTOpBase):
 
 
 
+class MultiStreamComplexDotOp(CuFFTOpBase):
+    def make_node(self, inp1, inp2):
+        inp1 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp1))
+        inp2 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp2))
+
+        assert inp1.dtype == "float32"
+        assert inp2.dtype == "float32"
+
+        return theano.Apply(self, [inp1, inp2], [self.output_type(inp1)()])
+
+    def output_type(self, inp):
+        return cuda.CudaNdarrayType(broadcastable=[False] * inp.type.ndim) # add one extra dim for real/imag
+
+    def make_thunk(self, node, storage_map, _, _2):
+        inputs = [ storage_map[v] for v in node.inputs]
+        outputs = [ storage_map[v] for v in node.outputs]
+
+        num_streams = 32
+
+        handle = [cublas.cublasCreate()]
+        stream_pool = [pycuda.driver.Stream() for _ in xrange(num_streams)]
+        current_stream = [0]
+
+        def thunk():
+            x = inputs[0]
+            y = inputs[1]
+
+            # chop off the real/imag dimension
+            input_shape_x = x[0].shape # (a, b, 2)
+            input_shape_y = y[0].shape # (b, c, 2)
+
+            output_shape = (input_shape_x[0], input_shape_y[1], 2) # (a, c, 2)
+
+            input_x_pycuda = to_complex_gpuarray(x[0])
+            input_y_pycuda = to_complex_gpuarray(y[0])
+
+            # multistream experiment
+            # print "DEBUG: Setting stream to %d" % current_stream[0]
+
+            # prev_stream_obj = stream_pool[(current_stream[0] - 1) % num_streams]
+            # print "PREV STREAM IS DONE?"
+            # print prev_stream_obj.is_done()
+            # print
+
+            stream_obj = stream_pool[current_stream[0]]
+            cublas.cublasSetStream(handle[0], stream_obj.handle)
+            current_stream[0] += 1
+            current_stream[0] %= num_streams
+            # print "DEBUG: set next stream id to %d" % current_stream[0]
+
+            output_pycuda = linalg.dot(input_x_pycuda, input_y_pycuda, handle=handle[0])
+
+            outputs[0][0] = to_complex_cudandarray(output_pycuda)
+
+        thunk.inputs = inputs
+        thunk.outputs = outputs
+        thunk.lazy = False
+
+        return thunk
+
+
+
 
 
 cufft = CuFFTOp()
 cuifft = CuIFFTOp()
 complex_dot = ComplexDotOp()
+# complex_dot = MultiStreamComplexDotOp()
 
 
 
@@ -701,11 +770,18 @@ if __name__ == '__main__':
     from theano.sandbox.cuda.basic_ops import host_from_gpu
     from theano.tensor.nnet import conv
 
-    x_shape = (64, 128, 32, 32)
-    w_shape = (64, 128, 8, 8)
+    # x_shape = (64, 128, 32, 32)
+    # w_shape = (64, 128, 8, 8)
+
+    # x_shape = (128, 32, 54, 54)
+    # w_shape = (64, 32, 6, 6)
 
     # x_shape = (128, 128, 16, 16)
     # w_shape = (128, 128, 8, 8)
+
+    x_shape = (64, 32, 64, 64)
+    w_shape = (64, 32, 32, 32)
+
 
     x = theano.shared(np.random.randn(*x_shape).astype('float32'))
     w = theano.shared(np.random.randn(*w_shape).astype('float32'))
@@ -749,115 +825,6 @@ if __name__ == '__main__':
     # for k in xrange(10):
     #     f_fft()
     # print "took %.5f seconds" % (time.time() - start_time)
-
-
-
-
-
-
-
-
-
-# class PycudaElemwiseSourceModuleMakeThunkOp(Op):
-#     nin = property(lambda self: self.scalar_op.nin)
-#     nout = property(lambda self: self.scalar_op.nout)
-
-#     def __init__(self, scalar_op, inplace_pattern=None, name=None):
-#         if inplace_pattern is None:
-#             inplace_pattern = {}
-#         self.name = name
-#         self.scalar_op = scalar_op
-#         self.inplace_pattern = inplace_pattern
-
-#     def __str__(self):
-#         if self.name is None:
-#             if self.inplace_pattern:
-#                 items = self.inplace_pattern.items()
-#                 items.sort()
-#                 return self.__class__.__name__ + "{%s}%s" % (self.scalar_op,
-#                                                              str(items))
-#             else:
-#                 return self.__class__.__name__ + "{%s}" % (self.scalar_op)
-#         else:
-#             return self.name
-
-#     def make_node(self, *inputs):
-#         assert self.nout == 1
-#         assert len(inputs) == 2  # TODO remove
-#         _inputs = [gpu_contiguous(as_cuda_ndarray_variable(i)) for i in inputs]
-#         if self.nin > 0 and len(_inputs) != self.nin:
-#             raise TypeError('Wrong argument count', (self.nin, len(_inputs)))
-#         for i in _inputs[1:]:
-#             if i.type.ndim != inputs[0].type.ndim:
-#                 raise TypeError('different ranks among inputs')
-
-#         if any([any(i.type.broadcastable) for i in inputs]):
-#             raise Exception("pycuda don't support broadcasted dimensions")
-
-#         otype = CudaNdarrayType(broadcastable=[False] * _inputs[0].type.ndim)
-#         out_node = Apply(self, _inputs, [otype() for o in xrange(self.nout)])
-#         return out_node
-
-#     def make_thunk(self, node, storage_map, _, _2):
-#         #TODO support broadcast!
-#         #TODO assert all input have the same shape
-#         fct_name = "pycuda_elemwise_%s" % str(self.scalar_op)
-#         in_name = ["i" + str(id) for id in range(len(node.inputs))]
-#         out_name = ["o" + str(id) for id in range(self.nout)]
-
-#         c_code = self.scalar_op.c_code(node, "some_name",
-#                                        tuple([n + "[i]" for n in in_name]),
-#                                        tuple(n + "[i]" for n in out_name), {})
-#         c_code_param = ", ".join([_replace_npy_types(var.type.dtype_specs()[1]) + " *" + name
-#                                   for var, name in
-#                                   zip(node.inputs, in_name) +
-#                                   zip(node.outputs, out_name)] + ["int size"])
-#         mod = SourceModule("""
-#   __global__ void %s(%s)
-#   {
-#     int i = (blockIdx.x+blockIdx.y*gridDim.x)*(blockDim.x*blockDim.y);
-#     i += threadIdx.x + threadIdx.y*blockDim.x;
-#     if(i<size){
-#         %s
-#     }
-#   }
-#   """ % (fct_name, c_code_param, c_code))
-#         pycuda_fct = mod.get_function(fct_name)
-#         inputs = [storage_map[v] for v in node.inputs]
-#         outputs = [storage_map[v] for v in node.outputs]
-
-#         def thunk():
-#             z = outputs[0]
-#             if (z[0] is None or
-#                 z[0].shape != inputs[0][0].shape or
-#                 not z[0].is_c_contiguous()):
-#                 z[0] = theano.sandbox.cuda.CudaNdarray.zeros(
-#                     inputs[0][0].shape)
-#             if inputs[0][0].shape != inputs[1][0].shape:
-#                 raise TypeError("PycudaElemwiseSourceModuleMakeThunkOp:"
-#                                 " inputs don't have the same shape!")
-
-#             if inputs[0][0].size > 512:
-#                 grid = (int(numpy.ceil(inputs[0][0].size / 512.)), 1)
-#                 block = (512, 1, 1)
-#             else:
-#                 grid = (1, 1)
-#                 block = (inputs[0][0].shape[0], inputs[0][0].shape[1], 1)
-#             out = pycuda_fct(inputs[0][0], inputs[1][0], z[0],
-#                              numpy.intc(inputs[1][0].size), block=block,
-#                              grid=grid)
-#         thunk.inputs = inputs
-#         thunk.outputs = outputs
-#         thunk.lazy = False
-
-#         return thunk
-
-
-
-
-
-
-
 
 
 
