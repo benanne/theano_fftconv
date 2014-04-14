@@ -1,20 +1,11 @@
 TODO
 
-- figure out how we can use cublasCgemmBatched for this instead (it's not in scikits.cuda but it should be easy to wrap)
-    * will need to upgrade cuda for this, it's not in cuda 5.0 (but probably in 5.5 and 6.0). Wait for now.
-
-- multistream does not seem to make any difference in performance (num_streams=1 and num_streams=32 perform the same)
-    * get rid of multistream code
+- do some proper performance testing on schaap for different b, ic, oc, i0/i1, f0/f1 combinations, make some pretty graphs
+    * compare to theano's own convop
+    * also compare to cuda-convnet where applicable
+    * make a script that times everything and stores results in an array or so.
 
 - optimise BatchedComplexDot, CuFFT and CuIFFT
-
-- do some proper performance testing for different b, ic, oc, i0/i1, f0/f1 combinations, make some pretty graphs
-
-- rescaling afterwards is also quite slow (I think Theano turns this into an elemwise div, even though I wrote it as a multiplication). Maybe this can be sped up as well.
-
-
-
-
 
 - build a convop optimisation that replaces the convop with the fft-product-ifft sequence.
 

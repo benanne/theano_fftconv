@@ -383,6 +383,87 @@ def sc_complex_dot(x_gpu, y_gpu, c_gpu, transa='N', transb='N', handle=None):
 
 
 
+def bptrs(a):
+    """
+    Pointer array when input represents a batch of matrices.
+
+    taken from scikits.cuda tests/test_cublas.py
+    """
+    
+    return pycuda.gpuarray.arange(a.ptr,a.ptr+a.shape[0]*a.strides[0],a.strides[0],
+                dtype=cublas.ctypes.c_void_p)
+
+
+
+def sc_complex_dot_batched(bx_gpu, by_gpu, bc_gpu, transa='N', transb='N', handle=None):
+    """
+    uses cublasCgemmBatched to compute a bunch of complex dot products in parallel
+    """
+    if handle is None:
+        handle = scikits.cuda.misc._global_cublas_handle
+
+    assert len(bx_gpu.shape) == 3
+    assert len(by_gpu.shape) == 3
+    assert len(bc_gpu.shape) == 3
+    assert bx_gpu.dtype == np.complex64
+    assert by_gpu.dtype == np.complex64 
+    assert bc_gpu.dtype == np.complex64
+
+    # Get the shapes of the arguments
+    bx_shape = bx_gpu.shape
+    by_shape = by_gpu.shape
+    
+    # Perform matrix multiplication for 2D arrays:
+    alpha = np.complex64(1.0)
+    beta = np.complex64(0.0)
+    
+    transa = string.lower(transa)
+    transb = string.lower(transb)
+
+    if transb in ['t', 'c']:
+        N, m, k = by_shape
+    elif transb in ['n']:
+        N, k, m = by_shape
+    else:
+        raise ValueError('invalid value for transb')
+
+    if transa in ['t', 'c']:
+        N2, l, n = bx_shape
+    elif transa in ['n']:
+        N2, n, l = bx_shape
+    else:
+        raise ValueError('invalid value for transa')
+
+    if l != k:
+        raise ValueError('objects are not aligned')
+
+    if N != N2:
+        raise ValueError('batch sizes are not the same')
+
+    if transb == 'n':
+        lda = max(1, m)
+    else:
+        lda = max(1, k)
+
+    if transa == 'n':
+        ldb = max(1, k)
+    else:
+        ldb = max(1, n)
+
+    ldc = max(1, m)
+
+    # construct pointer arrays needed for cublasCgemmBatched
+    bx_arr = bptrs(bx_gpu)
+    by_arr = bptrs(by_gpu)
+    bc_arr = bptrs(bc_gpu)
+
+    cublas.cublasCgemmBatched(handle, transb, transa, m, n, k, alpha, by_arr.gpudata,
+                lda, bx_arr.gpudata, ldb, beta, bc_arr.gpudata, ldc, N)
+
+
+
+
+
 
 class BatchedComplexDotOp(CuFFTOpBase):
     def make_node(self, inp1, inp2):
@@ -443,6 +524,62 @@ class BatchedComplexDotOp(CuFFTOpBase):
 
 
 
+class NativeBatchedComplexDotOp(CuFFTOpBase):
+    """
+    This version uses cublasCgemmBatched under the hood, instead of 
+    doing multiple cublasCgemm calls.
+    """
+    def make_node(self, inp1, inp2):
+        inp1 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp1))
+        inp2 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp2))
+
+        assert inp1.dtype == "float32"
+        assert inp2.dtype == "float32"
+        assert inp1.ndim == 4 # (batch, a, b, real/imag)
+        assert inp2.ndim == 4
+
+        return theano.Apply(self, [inp1, inp2], [self.output_type(inp1)()])
+
+    def output_type(self, inp):
+        return cuda.CudaNdarrayType(broadcastable=[False] * inp.type.ndim)
+
+    def make_thunk(self, node, storage_map, _, _2):
+        inputs = [ storage_map[v] for v in node.inputs]
+        outputs = [ storage_map[v] for v in node.outputs]
+
+        def thunk():
+            bx = inputs[0]
+            by = inputs[1]
+
+            input_shape_x = bx[0].shape # (batch, a, b, 2)
+            input_shape_y = by[0].shape # (batch, b, c, 2)
+
+            output_shape = (input_shape_x[0], input_shape_x[1], input_shape_y[2], 2) # (batch, a, c, 2)
+
+            bz = outputs[0]
+
+            # only allocate if there is no previous allocation of the right size.
+            if bz[0] is None or bz[0].shape != output_shape:
+                bz[0] = cuda.CudaNdarray.zeros(output_shape)
+
+            input_bx_pycuda = to_complex_gpuarray(bx[0])
+            input_by_pycuda = to_complex_gpuarray(by[0])
+            output_b_pycuda = to_complex_gpuarray(bz[0])
+
+            # fancy native batched version
+            sc_complex_dot_batched(input_bx_pycuda, input_by_pycuda, output_b_pycuda)
+
+
+
+  
+        thunk.inputs = inputs
+        thunk.outputs = outputs
+        thunk.lazy = False
+
+        return thunk
+
 
 
 
@@ -461,7 +598,7 @@ cuifft = CuIFFTOp()
 # complex_dot = ComplexDotOp()
 complex_dot = MultiStreamComplexDotOp()
 batched_complex_dot = BatchedComplexDotOp()
-
+native_batched_complex_dot = NativeBatchedComplexDotOp()
 
 
 
@@ -731,7 +868,8 @@ def mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v, i
     input_s = input_r.dimshuffle(2, 0, 1, 3) # (i0 * i1_f, b, ic, 2)
     filters_s = filters_r.dimshuffle(2, 1, 0, 3) # (i0 * i1_f, ic, oc, 2)
 
-    output_s = batched_complex_dot(input_s, filters_s)
+    # output_s = batched_complex_dot(input_s, filters_s)
+    output_s = native_batched_complex_dot(input_s, filters_s)
 
     # shuffle again
     output_r = output_s.dimshuffle(1, 2, 0, 3)
