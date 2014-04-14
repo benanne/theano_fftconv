@@ -15,6 +15,8 @@ import pycuda.driver
 
 import theano.misc.pycuda_init
 
+import string
+
 linalg.init()
 
 
@@ -214,6 +216,8 @@ class ComplexDotOp(CuFFTOpBase):
 
         assert inp1.dtype == "float32"
         assert inp2.dtype == "float32"
+        assert inp1.ndim == 3
+        assert inp2.dnim == 3
 
         return theano.Apply(self, [inp1, inp2], [self.output_type(inp1)()])
 
@@ -259,11 +263,13 @@ class MultiStreamComplexDotOp(CuFFTOpBase):
 
         assert inp1.dtype == "float32"
         assert inp2.dtype == "float32"
+        assert inp1.ndim == 3
+        assert inp2.ndim == 3
 
         return theano.Apply(self, [inp1, inp2], [self.output_type(inp1)()])
 
     def output_type(self, inp):
-        return cuda.CudaNdarrayType(broadcastable=[False] * inp.type.ndim) # add one extra dim for real/imag
+        return cuda.CudaNdarrayType(broadcastable=[False] * inp.type.ndim)
 
     def make_thunk(self, node, storage_map, _, _2):
         inputs = [ storage_map[v] for v in node.inputs]
@@ -316,10 +322,169 @@ class MultiStreamComplexDotOp(CuFFTOpBase):
 
 
 
+
+def sc_complex_dot(x_gpu, y_gpu, c_gpu, transa='N', transb='N', handle=None):
+    """
+    modified version of linalg.dot which allows for the target output array to be specified.
+    This function does not return anything.
+    """
+    if handle is None:
+        handle = misc._global_cublas_handle
+
+    assert len(x_gpu.shape) == 2
+    assert len(y_gpu.shape) == 2
+    assert len(c_gpu.shape) == 2
+    assert x_gpu.dtype == np.complex64
+    assert y_gpu.dtype == np.complex64 
+    assert c_gpu.dtype == np.complex64
+
+    # Get the shapes of the arguments
+    x_shape = x_gpu.shape
+    y_shape = y_gpu.shape
+    
+    # Perform matrix multiplication for 2D arrays:
+    alpha = np.complex64(1.0)
+    beta = np.complex64(0.0)
+    
+    transa = string.lower(transa)
+    transb = string.lower(transb)
+
+    if transb in ['t', 'c']:
+        m, k = y_shape
+    elif transb in ['n']:
+        k, m = y_shape
+    else:
+        raise ValueError('invalid value for transb')
+
+    if transa in ['t', 'c']:
+        l, n = x_shape
+    elif transa in ['n']:
+        n, l = x_shape
+    else:
+        raise ValueError('invalid value for transa')
+
+    if l != k:
+        raise ValueError('objects are not aligned')
+
+    if transb == 'n':
+        lda = max(1, m)
+    else:
+        lda = max(1, k)
+
+    if transa == 'n':
+        ldb = max(1, k)
+    else:
+        ldb = max(1, n)
+
+    ldc = max(1, m)
+
+    cublas.cublasCgemm(handle, transb, transa, m, n, k, alpha, y_gpu.gpudata,
+                lda, x_gpu.gpudata, ldb, beta, c_gpu.gpudata, ldc)
+
+
+
+
+class BatchedComplexDotOp(CuFFTOpBase):
+    def make_node(self, inp1, inp2):
+        inp1 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp1))
+        inp2 = cuda.basic_ops.gpu_contiguous(
+           cuda.basic_ops.as_cuda_ndarray_variable(inp2))
+
+        assert inp1.dtype == "float32"
+        assert inp2.dtype == "float32"
+        assert inp1.ndim == 4 # (batch, a, b, real/imag)
+        assert inp2.ndim == 4
+
+        return theano.Apply(self, [inp1, inp2], [self.output_type(inp1)()])
+
+    def output_type(self, inp):
+        return cuda.CudaNdarrayType(broadcastable=[False] * inp.type.ndim)
+
+    def make_thunk(self, node, storage_map, _, _2):
+        inputs = [ storage_map[v] for v in node.inputs]
+        outputs = [ storage_map[v] for v in node.outputs]
+
+        num_streams = 32
+
+        handle = [cublas.cublasCreate()]
+        stream_pool = [pycuda.driver.Stream() for _ in xrange(num_streams)]
+        current_stream = [0]
+
+        def thunk():
+            bx = inputs[0]
+            by = inputs[1]
+
+            input_shape_x = bx[0].shape # (batch, a, b, 2)
+            input_shape_y = by[0].shape # (batch, b, c, 2)
+
+            output_shape = (input_shape_x[0], input_shape_x[1], input_shape_y[2], 2) # (batch, a, c, 2)
+
+            bz = outputs[0]
+
+            # only allocate if there is no previous allocation of the right size.
+            if bz[0] is None or bz[0].shape != output_shape:
+                bz[0] = cuda.CudaNdarray.zeros(output_shape)
+
+
+            input_bx_pycuda = to_complex_gpuarray(bx[0])
+            input_by_pycuda = to_complex_gpuarray(by[0])
+            output_b_pycuda = to_complex_gpuarray(bz[0])
+
+            # we want to write the results to one big contiguous array, so we can't
+            # use linalg.dot here (it creates a new array and returns it)
+            # so call cublasCgemm manually.
+
+            for i in xrange(input_shape_x[0]): # batch iter
+                input_x_pycuda = input_bx_pycuda[i]
+                input_y_pycuda = input_by_pycuda[i]
+                output_pycuda = output_b_pycuda[i]
+
+                # prev_stream_obj = stream_pool[(current_stream[0] - 1) % num_streams]
+                # print "DEBUG: PREV STREAM IS DONE?"
+                # print prev_stream_obj.is_done()
+                # print
+
+                # set stream and increment counter
+                stream_obj = stream_pool[current_stream[0]]
+                cublas.cublasSetStream(handle[0], stream_obj.handle)
+                current_stream[0] += 1
+                current_stream[0] %= num_streams
+
+                sc_complex_dot(input_x_pycuda, input_y_pycuda, output_pycuda, handle=handle[0])
+
+            # multistream experiment
+            # print "DEBUG: Setting stream to %d" % current_stream[0]
+
+
+
+        
+        thunk.inputs = inputs
+        thunk.outputs = outputs
+        thunk.lazy = False
+
+        return thunk
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 cufft = CuFFTOp()
 cuifft = CuIFFTOp()
-complex_dot = ComplexDotOp()
-# complex_dot = MultiStreamComplexDotOp()
+# complex_dot = ComplexDotOp()
+complex_dot = MultiStreamComplexDotOp()
+batched_complex_dot = BatchedComplexDotOp()
 
 
 
@@ -525,9 +690,7 @@ def mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v):
     """
     IMPORTANT: this requires input where the b and oc axes HAVE NOT BEEN SEPARATED.
 
-    This version uses theano.tensor.batched_dot to do the multiplication and reduction in one go.
-    If b, ic and oc are large enough, this should be fast - but it does two dot products for each
-    pixel in the input image! That might be painful.
+    This version uses a custom ComplexDot op together with scan.
 
     input_fft_v is (b, ic, i0, i1//2 + 1, 2)
     filters_fft_v is (oc, ic, i0, i1//2 + 1, 2)
@@ -565,7 +728,36 @@ def mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v):
 
 
 
+def mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v):
+    """
+    IMPORTANT: this requires input where the b and oc axes HAVE NOT BEEN SEPARATED.
 
+    This version uses a custom BatchedComplexDot op (no scan) and multiple streams.
+
+    input_fft_v is (b, ic, i0, i1//2 + 1, 2)
+    filters_fft_v is (oc, ic, i0, i1//2 + 1, 2)
+    """
+
+    b, ic, i0, i1_f, _ = input_fft_v.shape 
+    oc = filters_fft_v.shape[0]
+
+    # reshape to flatten the dimensions that are multiplied elemwise
+    input_r = input_fft_v.reshape((b, ic, i0 * i1_f, 2))
+    filters_r = filters_fft_v.reshape((oc, ic, i0 * i1_f, 2))
+
+    # shuffle for batched dot product
+    input_s = input_r.dimshuffle(2, 0, 1, 3) # (i0 * i1_f, b, ic, 2)
+    filters_s = filters_r.dimshuffle(2, 1, 0, 3) # (i0 * i1_f, ic, oc, 2)
+
+    output_s = batched_complex_dot(input_s, filters_s)
+
+    # shuffle again
+    output_r = output_s.dimshuffle(1, 2, 0, 3)
+
+    # reshape to unflatten
+    output = output_r.reshape((b, oc, i0, i1_f, 2))
+
+    return output
 
 
 
@@ -631,7 +823,8 @@ def conv2d_fft(input, filters, image_shape=None, filter_shape=None):
     # output_fft_s = mult_and_reduce_batched_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
     # output_fft_s = mult_and_reduce_scan(input_fft_u, filters_fft_u)
     # output_fft_s = mult_and_reduce_scan_late_concat(input_fft_u, filters_fft_u)
-    output_fft_s = mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
+    # output_fft_s = mult_and_reduce_batched_complex_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
+    output_fft_s = mult_and_reduce_standalone_batched_complex_dot(input_fft_v, filters_fft_v) # (b, oc, i0, i1//2 + 1, 2)
 
     # reshape for IFFT
     output_fft_flat = output_fft_s.reshape((b * oc, i0, i1//2 + 1, 2))
@@ -773,14 +966,17 @@ if __name__ == '__main__':
     # x_shape = (64, 128, 32, 32)
     # w_shape = (64, 128, 8, 8)
 
-    # x_shape = (128, 32, 54, 54)
-    # w_shape = (64, 32, 6, 6)
+    x_shape = (128, 32, 54, 54)
+    w_shape = (64, 32, 6, 6)
 
     # x_shape = (128, 128, 16, 16)
     # w_shape = (128, 128, 8, 8)
 
-    x_shape = (64, 32, 64, 64)
-    w_shape = (64, 32, 32, 32)
+    # x_shape = (64, 3, 128, 128)
+    # w_shape = (128, 3, 16, 16)
+
+    # x_shape = (128, 1024, 32, 32)
+    # w_shape = (128, 1024, 4, 4)
 
 
     x = theano.shared(np.random.randn(*x_shape).astype('float32'))
