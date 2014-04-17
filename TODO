@@ -1,14 +1,15 @@
 TODO
 
 - do some proper performance testing on schaap for different b, ic, oc, i0/i1, f0/f1 combinations, make some pretty graphs
-    * compare to theano's own convop
-    * also compare to cuda-convnet where applicable
-    * make a script that times everything and stores results in an array or so.
 
-- optimise BatchedComplexDot, CuFFT and CuIFFT
+- add support for full convolutions (pad the input as well + extra padding for the filters)
+    * I think this is necessary for the gradient
+
+- is it possible to support strided convolutions?
 
 - build a convop optimisation that replaces the convop with the fft-product-ifft sequence.
 
+- look for other optimisations for BatchedComplexDot and CuFFT
 
 
 
